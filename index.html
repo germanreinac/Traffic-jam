@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Traffic Jam</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #f1efe9; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; cursor: pointer; }
+  .hud {
+    position: fixed; left: 0; right: 0; text-align: center; pointer-events: none;
+    font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    letter-spacing: .08em; color: #1a1a1a; user-select: none;
+  }
+  #stats { top: 18px; }
+  #hint { bottom: 16px; opacity: .45; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="hud" id="stats"></div>
+<div class="hud" id="hint">tap a tile: place / rotate arrow &nbsp;·&nbsp; right-click: remove &nbsp;·&nbsp; C: clear &nbsp;·&nbsp; space: pause</div>
+<script>
+(() => {
+  // ---------- config ----------
+  const N = 12;                 // grid size (tiles)
+  const LANES = [5, 6];         // highway columns; traffic flows toward +y
+  const SPEED = 1.7;            // tiles / second
+  const R = 0.23;               // collision radius (tiles)
+  const GAP = 0.8;              // following distance
+  const MAX_CARS = 160;
+  const INK = '#1a1a1a', PAPER = '#f1efe9', ACCENT = '#ff5a36';
+  // arrow directions in click order: deviate one way, the other, against, with
+  const ORDER = [[1, 0], [-1, 0], [0, -1], [0, 1]];
+
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const statsEl = document.getElementById('stats');
+
+  let W = 0, H = 0, TW = 0, TH = 0, OX = 0, OY = 0;
+  let cars = [], rings = [];
+  const arrows = new Map();     // "x,y" -> index into ORDER
+  let hover = null, paused = false;
+  let passed = 0, incidents = 0;
+  let spawnT = LANES.map(() => Math.random());
+
+  // ---------- projection ----------
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = innerWidth; H = innerHeight;
+    canvas.width = W * dpr; canvas.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    TW = Math.min((W * 0.94) / N, (H * 0.8) / (N / 2));
+    TH = TW / 2;
+    OX = W / 2;
+    OY = H / 2 - ((N - 1) * TH) / 2;
+  }
+  const px = (gx, gy) => OX + (gx - gy) * TW / 2;
+  const py = (gx, gy) => OY + (gx + gy) * TH / 2;
+  function toGrid(sx, sy) {
+    const a = (sx - OX) / (TW / 2), b = (sy - OY) / (TH / 2);
+    return [(a + b) / 2, (b - a) / 2];
+  }
+  const inside = (x, y) => x >= 0 && y >= 0 && x < N && y < N;
+
+  // ---------- simulation ----------
+  function spawn(lane) {
+    const x = lane, y = -1.15;
+    for (const c of cars) if (Math.hypot(c.x - x, c.y - y) < 0.95) return false;
+    cars.push({ x, y, dx: 0, dy: 1, ang: Math.PI / 2, v: SPEED, wreck: false, vx: 0, vy: 0, w: 0 });
+    return true;
+  }
+
+  function outside(c) {
+    return Math.max(0, -0.5 - c.x, c.x - (N - 0.5), -0.5 - c.y, c.y - (N - 0.5));
+  }
+
+  function step(dt) {
+    // spawn
+    if (cars.length < MAX_CARS) {
+      LANES.forEach((lane, i) => {
+        spawnT[i] -= dt;
+        if (spawnT[i] <= 0) spawnT[i] = spawn(lane) ? 0.65 + Math.random() * 1.1 : 0.2;
+      });
+    }
+
+    for (const c of cars) {
+      if (c.wreck) {
+        c.x += c.vx * dt; c.y += c.vy * dt; c.ang += c.w * dt;
+        const f = Math.exp(-3.5 * dt);
+        c.vx *= f; c.vy *= f; c.w *= Math.exp(-2.5 * dt);
+        continue;
+      }
+      // keep distance from live cars ahead going the same way
+      let target = SPEED;
+      for (const o of cars) {
+        if (o === c || o.wreck || o.dx !== c.dx || o.dy !== c.dy) continue;
+        const rx = o.x - c.x, ry = o.y - c.y;
+        const along = rx * c.dx + ry * c.dy;
+        const lat = Math.abs(rx * c.dy - ry * c.dx);
+        if (along > 0 && along < GAP + 0.5 && lat < 0.3)
+          target = Math.min(target, SPEED * Math.max(0, (along - GAP) / 0.5));
+      }
+      c.v += (target - c.v) * Math.min(1, 10 * dt);
+      c.x += c.dx * c.v * dt; c.y += c.dy * c.v * dt;
+      // pull back to lane centre
+      const k = Math.min(1, 6 * dt);
+      if (c.dx !== 0) c.y += (Math.round(c.y) - c.y) * k;
+      else c.x += (Math.round(c.x) - c.x) * k;
+      // obey arrow once the tile centre is reached
+      const tx = Math.round(c.x), ty = Math.round(c.y);
+      const a = arrows.get(tx + ',' + ty);
+      if (a !== undefined) {
+        const [ax, ay] = ORDER[a];
+        if ((ax !== c.dx || ay !== c.dy) && (c.x - tx) * c.dx + (c.y - ty) * c.dy >= 0) {
+          c.dx = ax; c.dy = ay;
+        }
+      }
+      // steer body toward heading
+      let d = Math.atan2(c.dy, c.dx) - c.ang;
+      d = Math.atan2(Math.sin(d), Math.cos(d));
+      c.ang += d * Math.min(1, 12 * dt);
+    }
+
+    // collisions: crossing traffic crashes, everything else just shoves
+    for (let i = 0; i < cars.length; i++) {
+      const a = cars[i];
+      for (let j = i + 1; j < cars.length; j++) {
+        const b = cars[j];
+        let nx = b.x - a.x, ny = b.y - a.y;
+        const d = Math.hypot(nx, ny);
+        if (d >= 2 * R || d === 0) continue;
+        nx /= d; ny /= d;
+        if (!a.wreck && !b.wreck && (a.dx !== b.dx || a.dy !== b.dy)) {
+          const mx = (a.dx * a.v + b.dx * b.v) / 2, my = (a.dy * a.v + b.dy * b.v) / 2;
+          for (const c of [a, b]) {
+            c.wreck = true;
+            c.vx = mx + c.dx * c.v * 0.25; c.vy = my + c.dy * c.v * 0.25;
+            c.w = (Math.random() - 0.5) * 9;
+          }
+          incidents++;
+          rings.push({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, t: 0 });
+        }
+        const push = (2 * R - d) / 2;
+        a.x -= nx * push; a.y -= ny * push;
+        b.x += nx * push; b.y += ny * push;
+        if (a.wreck !== b.wreck) (a.wreck ? a : b).w += (Math.random() - 0.5) * 6 * dt;
+      }
+    }
+
+    cars = cars.filter(c => {
+      if (outside(c) <= 0.7) return true;
+      if (!c.wreck) passed++;
+      return false;
+    });
+    for (const r of rings) r.t += dt;
+    rings = rings.filter(r => r.t < 0.7);
+  }
+
+  // ---------- rendering ----------
+  function poly(pts, fill, stroke) {
+    ctx.beginPath();
+    pts.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]));
+    ctx.closePath();
+    if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+    if (stroke) { ctx.strokeStyle = stroke; ctx.stroke(); }
+  }
+
+  // iso box: footprint centred at (cx,cy), rotated by ang, from height z0 to z1 (px)
+  function box(cx, cy, ang, hl, hw, z0, z1, top, left, right) {
+    const ca = Math.cos(ang), sa = Math.sin(ang);
+    const loc = [[hl, hw], [-hl, hw], [-hl, -hw], [hl, -hw]];
+    const g = loc.map(([f, s]) => [cx + f * ca - s * sa, cy + f * sa + s * ca]);
+    for (let i = 0; i < 4; i++) {
+      const p = g[i], q = g[(i + 1) % 4];
+      const nx = (p[0] + q[0]) / 2 - cx, ny = (p[1] + q[1]) / 2 - cy;
+      if (nx + ny <= 0) continue;                       // facing away from camera
+      poly([[px(...p), py(...p) - z0], [px(...q), py(...q) - z0],
+            [px(...q), py(...q) - z1], [px(...p), py(...p) - z1]],
+           nx - ny > 0 ? right : left, INK);
+    }
+    poly(g.map(p => [px(...p), py(...p) - z1]), top, INK);
+  }
+
+  function drawCar(c) {
+    const a = Math.max(0, 1 - outside(c) / 0.7);
+    if (a <= 0) return;
+    ctx.globalAlpha = a;
+    const h = TW * 0.13;
+    // ground shadow
+    ctx.fillStyle = 'rgba(26,26,26,.10)';
+    ctx.beginPath();
+    ctx.ellipse(px(c.x, c.y), py(c.x, c.y), TW * 0.2, TH * 0.2, 0, 0, 7);
+    ctx.fill();
+    const col = c.wreck ? ['#3a3936', '#2b2a28', '#1f1e1d'] : ['#fbfaf6', '#e2dfd6', '#cfcbc0'];
+    box(c.x, c.y, c.ang, 0.3, 0.16, 0, h, ...col);
+    const ox = -0.05 * Math.cos(c.ang), oy = -0.05 * Math.sin(c.ang);
+    box(c.x + ox, c.y + oy, c.ang, 0.14, 0.125, h, h * 1.75, ...col);
+    ctx.globalAlpha = 1;
+  }
+
+  function drawArrow(tx, ty, idx, alpha) {
+    const [dx, dy] = ORDER[idx];
+    const shape = [[0.33, 0], [0.02, 0.28], [0.02, 0.11], [-0.3, 0.11],
+                   [-0.3, -0.11], [0.02, -0.11], [0.02, -0.28]];
+    const pts = shape.map(([f, s]) => {
+      const gx = tx + f * dx - s * dy, gy = ty + f * dy + s * dx;
+      return [px(gx, gy), py(gx, gy)];
+    });
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.shadowColor = ACCENT; ctx.shadowBlur = TW * 0.35;
+    poly(pts, ACCENT, null);
+    ctx.restore();
+  }
+
+  function tilePts(x, y) {
+    return [[x - .5, y - .5], [x + .5, y - .5], [x + .5, y + .5], [x - .5, y + .5]]
+      .map(p => [px(...p), py(...p)]);
+  }
+
+  function draw(time) {
+    ctx.fillStyle = PAPER;
+    ctx.fillRect(0, 0, W, H);
+    ctx.lineJoin = 'round';
+
+    // grid
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = 'rgba(26,26,26,.13)';
+    ctx.beginPath();
+    for (let i = 0; i <= N; i++) {
+      const t = i - 0.5;
+      ctx.moveTo(px(t, -0.5), py(t, -0.5)); ctx.lineTo(px(t, N - 0.5), py(t, N - 0.5));
+      ctx.moveTo(px(-0.5, t), py(-0.5, t)); ctx.lineTo(px(N - 0.5, t), py(N - 0.5, t));
+    }
+    ctx.stroke();
+    ctx.lineWidth = 1.5;
+    poly([[-.5, -.5], [N - .5, -.5], [N - .5, N - .5], [-.5, N - .5]].map(p => [px(...p), py(...p)]), null, INK);
+
+    // hover + arrows
+    if (hover) poly(tilePts(hover[0], hover[1]), 'rgba(26,26,26,.06)', null);
+    const pulse = 0.82 + 0.18 * Math.sin(time / 260);
+    for (const [key, idx] of arrows) {
+      const [x, y] = key.split(',').map(Number);
+      drawArrow(x, y, idx, pulse);
+    }
+
+    // crash rings
+    for (const r of rings) {
+      const k = r.t / 0.7;
+      ctx.strokeStyle = `rgba(255,90,54,${1 - k})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.ellipse(px(r.x, r.y), py(r.x, r.y), TW * (0.2 + k * 0.7), TH * (0.2 + k * 0.7), 0, 0, 7);
+      ctx.stroke();
+    }
+
+    // cars, back to front
+    ctx.lineWidth = Math.max(1, TW / 38);
+    cars.sort((a, b) => (a.x + a.y) - (b.x + b.y));
+    for (const c of cars) drawCar(c);
+
+    statsEl.textContent =
+      String(passed).padStart(4, '0') + ' through   ' +
+      String(incidents).padStart(3, '0') + ' incidents' + (paused ? '   paused' : '');
+  }
+
+  // ---------- input ----------
+  function tileAt(e) {
+    const [gx, gy] = toGrid(e.clientX, e.clientY);
+    const x = Math.round(gx), y = Math.round(gy);
+    return inside(x, y) ? [x, y] : null;
+  }
+  canvas.addEventListener('pointermove', e => { hover = e.pointerType === 'touch' ? null : tileAt(e); });
+  canvas.addEventListener('pointerleave', () => { hover = null; });
+  canvas.addEventListener('pointerdown', e => {
+    const t = tileAt(e);
+    if (!t) return;
+    const key = t[0] + ',' + t[1];
+    if (e.button === 2) { arrows.delete(key); return; }
+    const cur = arrows.get(key);
+    if (cur === undefined) arrows.set(key, 0);
+    else if (cur + 1 < ORDER.length) arrows.set(key, cur + 1);
+    else arrows.delete(key);
+  });
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+  addEventListener('keydown', e => {
+    if (e.key === 'c' || e.key === 'C') arrows.clear();
+    if (e.key === ' ') { paused = !paused; e.preventDefault(); }
+  });
+  addEventListener('resize', resize);
+
+  // ---------- loop ----------
+  resize();
+  let last = performance.now();
+  function frame(now) {
+    let dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    if (!paused) { step(dt / 2); step(dt / 2); }
+    draw(now);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  // test hook
+  window.__tj = { arrows, get cars() { return cars; }, get stats() { return { passed, incidents }; } };
+})();
+</script>
+</body>
+</html>
