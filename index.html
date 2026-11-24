@@ -3,6 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<meta name="description" content="A minimalist isometric traffic toy. Place arrow boards, divert the highway, fill the screen.">
+<meta name="theme-color" content="#f1efe9">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231f1e1d'/%3E%3Cpath d='M26 16 16 7v5.500H6v7h10V25z' fill='%23ff5a36'/%3E%3C/svg%3E">
 <title>Traffic Jam</title>
 <style>
   html, body { margin: 0; height: 100%; background: #f1efe9; overflow: hidden; }
@@ -10,91 +13,130 @@
   .hud {
     position: fixed; left: 0; right: 0; text-align: center; pointer-events: none;
     font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    letter-spacing: .08em; color: #1a1a1a; user-select: none;
+    letter-spacing: .08em; color: #1a1a1a; user-select: none; -webkit-user-select: none;
   }
+  .hud span { background: #f1efe9; padding: 3px 8px; border-radius: 3px; }
   #stats { top: 18px; }
-  #hint { bottom: 16px; opacity: .45; }
+  #hint { bottom: 14px; }
+  #hint span { color: rgba(26,26,26,.55); }
+  #hint i { font-style: normal; }
+  @media (max-width: 560px) { #hint i { display: none; } }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
-<div class="hud" id="stats"></div>
-<div class="hud" id="hint">tap a tile: place / rotate arrow &nbsp;·&nbsp; right-click: remove &nbsp;·&nbsp; C: clear &nbsp;·&nbsp; space: pause</div>
+<div class="hud" id="stats"><span id="statsText"></span></div>
+<div class="hud" id="hint"><span>pick arrow &nbsp;·&nbsp; tap to rotate<i> &nbsp;·&nbsp; drag back to remove</i></span></div>
 <script>
 (() => {
   // ---------- config ----------
-  const N = 12;                 // grid size (tiles)
-  const LANES = [5, 6];         // highway columns; traffic flows toward +y
+  const LANES = [0, 1];         // highway columns; traffic flows toward +y
   const SPEED = 1.7;            // tiles / second
   const R = 0.23;               // collision radius (tiles)
   const GAP = 0.8;              // following distance
-  const MAX_CARS = 160;
+  const MAX_CARS = 420;
+  const FILL_MEMORY = 9;        // seconds a tile stays "filled" after a car passes
   const INK = '#1a1a1a', PAPER = '#f1efe9', ACCENT = '#ff5a36';
-  // arrow directions in click order: deviate one way, the other, against, with
-  const ORDER = [[1, 0], [-1, 0], [0, -1], [0, 1]];
+  const WHITE = ['#fbfaf6', '#e2dfd6', '#cfcbc0'];   // top, left, right faces
+  const BLACK = ['#3a3936', '#2b2a28', '#1f1e1d'];
+  // arrow directions, in tap-to-rotate order
+  const DIRS = [[1, 0], [0, 1], [-1, 0], [0, -1]];
+  const dirIndex = (dx, dy) => DIRS.findIndex(d => d[0] === dx && d[1] === dy);
 
   const canvas = document.getElementById('c');
   const ctx = canvas.getContext('2d');
-  const statsEl = document.getElementById('stats');
+  const statsEl = document.getElementById('statsText');
 
   let W = 0, H = 0, TW = 0, TH = 0, OX = 0, OY = 0;
+  let spawnY = -10, visTiles = [], gridBounds = [0, 0, 0, 0];
+  let tray = { x: 0, y: 0, r: 36 };
   let cars = [], rings = [];
-  const arrows = new Map();     // "x,y" -> index into ORDER
-  let hover = null, paused = false;
-  let passed = 0, incidents = 0;
+  const arrows = new Map();     // "x,y" -> index into DIRS
+  const heat = new Map();       // "x,y" -> sim time of last car
+  let simT = 0, paused = false, incidents = 0, nextId = 1;
   let spawnT = LANES.map(() => Math.random());
 
+  // pointer state
+  let ptr = null;               // {x, y} last pointer position (mouse only for hover)
+  let drag = null;              // {type:'new'|'move', idx, key, sx, sy, moved}
+  let armed = false;            // arrow picked from tray, waiting for a tile tap
+
   // ---------- projection ----------
-  function resize() {
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    W = innerWidth; H = innerHeight;
-    canvas.width = W * dpr; canvas.height = H * dpr;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    TW = Math.min((W * 0.94) / N, (H * 0.8) / (N / 2));
-    TH = TW / 2;
-    OX = W / 2;
-    OY = H / 2 - ((N - 1) * TH) / 2;
-  }
   const px = (gx, gy) => OX + (gx - gy) * TW / 2;
   const py = (gx, gy) => OY + (gx + gy) * TH / 2;
   function toGrid(sx, sy) {
     const a = (sx - OX) / (TW / 2), b = (sy - OY) / (TH / 2);
     return [(a + b) / 2, (b - a) / 2];
   }
-  const inside = (x, y) => x >= 0 && y >= 0 && x < N && y < N;
+  // distance outside the viewport, in tile widths
+  function off(gx, gy) {
+    const sx = px(gx, gy), sy = py(gx, gy);
+    return Math.max(0, -sx, sx - W, -sy, sy - H) / TW;
+  }
+
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = innerWidth; H = innerHeight;
+    canvas.width = W * dpr; canvas.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    TW = Math.max(54, Math.min(110, Math.min(W, H) / 8.5));
+    TH = TW / 2;
+    OX = W / 2 - TW / 4;        // the highway runs through the screen centre
+    OY = H / 2 - TH / 4;
+    tray = { x: W / 2, y: H - 84, r: Math.max(34, TW * 0.42) };
+
+    // grid extent covering the viewport
+    const cs = [toGrid(0, 0), toGrid(W, 0), toGrid(0, H), toGrid(W, H)];
+    gridBounds = [
+      Math.floor(Math.min(...cs.map(c => c[0]))) - 1, Math.ceil(Math.max(...cs.map(c => c[0]))) + 1,
+      Math.floor(Math.min(...cs.map(c => c[1]))) - 1, Math.ceil(Math.max(...cs.map(c => c[1]))) + 1,
+    ];
+    visTiles = [];
+    for (let x = gridBounds[0]; x <= gridBounds[1]; x++)
+      for (let y = gridBounds[2]; y <= gridBounds[3]; y++)
+        if (off(x, y) === 0) visTiles.push(x + ',' + y);
+
+    spawnY = 0;
+    while (LANES.some(l => off(l, spawnY) < 1)) spawnY--;
+  }
 
   // ---------- simulation ----------
   function spawn(lane) {
-    const x = lane, y = -1.15;
-    for (const c of cars) if (Math.hypot(c.x - x, c.y - y) < 0.95) return false;
-    cars.push({ x, y, dx: 0, dy: 1, ang: Math.PI / 2, v: SPEED, wreck: false, vx: 0, vy: 0, w: 0 });
+    for (const c of cars) if (Math.hypot(c.x - lane, c.y - spawnY) < 0.95) return false;
+    cars.push({
+      id: nextId++, x: lane, y: spawnY, dx: 0, dy: 1, ang: Math.PI / 2, v: SPEED,
+      hit: false, m: 0.6 + Math.random() * 0.8,
+    });
     return true;
   }
 
-  function outside(c) {
-    return Math.max(0, -0.5 - c.x, c.x - (N - 0.5), -0.5 - c.y, c.y - (N - 0.5));
+  // An arrow board diverts the whole road, not just its own tile: lanes on
+  // either side turn along a diagonal so the lines stay side by side.
+  function arrowFor(tx, ty, dx, dy) {
+    for (const [ax, ay] of [[-dy, dx], [dy, -dx]]) {
+      const want = dirIndex(ax, ay);
+      for (let s = -1; s <= 1; s++) {
+        const key = (tx - s * (ax - dx)) + ',' + (ty - s * (ay - dy));
+        if (arrows.get(key) === want) return [ax, ay];
+      }
+    }
+    return null;
   }
 
   function step(dt) {
-    // spawn
+    simT += dt;
     if (cars.length < MAX_CARS) {
       LANES.forEach((lane, i) => {
         spawnT[i] -= dt;
-        if (spawnT[i] <= 0) spawnT[i] = spawn(lane) ? 0.65 + Math.random() * 1.1 : 0.2;
+        if (spawnT[i] <= 0) spawnT[i] = spawn(lane) ? 0.65 + Math.random() * 0.9 : 0.2;
       });
     }
 
     for (const c of cars) {
-      if (c.wreck) {
-        c.x += c.vx * dt; c.y += c.vy * dt; c.ang += c.w * dt;
-        const f = Math.exp(-3.5 * dt);
-        c.vx *= f; c.vy *= f; c.w *= Math.exp(-2.5 * dt);
-        continue;
-      }
-      // keep distance from live cars ahead going the same way
+      // keep distance from cars ahead going the same way
       let target = SPEED;
       for (const o of cars) {
-        if (o === c || o.wreck || o.dx !== c.dx || o.dy !== c.dy) continue;
+        if (o === c || o.dx !== c.dx || o.dy !== c.dy) continue;
         const rx = o.x - c.x, ry = o.y - c.y;
         const along = rx * c.dx + ry * c.dy;
         const lat = Math.abs(rx * c.dy - ry * c.dx);
@@ -104,55 +146,55 @@
       c.v += (target - c.v) * Math.min(1, 10 * dt);
       c.x += c.dx * c.v * dt; c.y += c.dy * c.v * dt;
       // pull back to lane centre
-      const k = Math.min(1, 6 * dt);
+      const k = Math.min(1, 5 * dt);
       if (c.dx !== 0) c.y += (Math.round(c.y) - c.y) * k;
       else c.x += (Math.round(c.x) - c.x) * k;
-      // obey arrow once the tile centre is reached
+      // obey arrow boards once the tile centre is reached
       const tx = Math.round(c.x), ty = Math.round(c.y);
-      const a = arrows.get(tx + ',' + ty);
-      if (a !== undefined) {
-        const [ax, ay] = ORDER[a];
-        if ((ax !== c.dx || ay !== c.dy) && (c.x - tx) * c.dx + (c.y - ty) * c.dy >= 0) {
-          c.dx = ax; c.dy = ay;
-        }
+      if (arrows.size && (c.x - tx) * c.dx + (c.y - ty) * c.dy >= 0) {
+        const a = arrowFor(tx, ty, c.dx, c.dy);
+        if (a) { c.dx = a[0]; c.dy = a[1]; }
       }
-      // steer body toward heading
+      if (off(c.x, c.y) === 0) heat.set(tx + ',' + ty, simT);
+      // steer body toward heading (battered cars straighten out slowly)
       let d = Math.atan2(c.dy, c.dx) - c.ang;
       d = Math.atan2(Math.sin(d), Math.cos(d));
-      c.ang += d * Math.min(1, 12 * dt);
+      c.ang += d * Math.min(1, (c.hit ? 5 : 12) * dt);
     }
 
-    // collisions: crossing traffic crashes, everything else just shoves
+    // collisions: crossing traffic crashes, turns black, and shoves its way through
     for (let i = 0; i < cars.length; i++) {
       const a = cars[i];
       for (let j = i + 1; j < cars.length; j++) {
         const b = cars[j];
         let nx = b.x - a.x, ny = b.y - a.y;
+        if (nx > 0.5 || nx < -0.5 || ny > 0.5 || ny < -0.5) continue;
         const d = Math.hypot(nx, ny);
         if (d >= 2 * R || d === 0) continue;
         nx /= d; ny /= d;
-        if (!a.wreck && !b.wreck && (a.dx !== b.dx || a.dy !== b.dy)) {
-          const mx = (a.dx * a.v + b.dx * b.v) / 2, my = (a.dy * a.v + b.dy * b.v) / 2;
+        const push = 2 * R - d, mt = a.m + b.m;
+        a.x -= nx * push * b.m / mt; a.y -= ny * push * b.m / mt;
+        b.x += nx * push * a.m / mt; b.y += ny * push * a.m / mt;
+        if (a.dx === b.dx && a.dy === b.dy) continue;
+        // slide around each other so the knot never locks up
+        const slip = 0.7 * dt;
+        a.x += ny * slip; a.y -= nx * slip;
+        b.x -= ny * slip; b.y += nx * slip;
+        a.ang += (Math.random() - 0.5) * 8 * dt;
+        b.ang += (Math.random() - 0.5) * 8 * dt;
+        if (!a.hit || !b.hit) {
           for (const c of [a, b]) {
-            c.wreck = true;
-            c.vx = mx + c.dx * c.v * 0.25; c.vy = my + c.dy * c.v * 0.25;
-            c.w = (Math.random() - 0.5) * 9;
+            if (c.hit) continue;
+            c.hit = true; c.v *= 0.3;
+            c.ang += (Math.random() - 0.5) * 2.2;
           }
           incidents++;
           rings.push({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, t: 0 });
         }
-        const push = (2 * R - d) / 2;
-        a.x -= nx * push; a.y -= ny * push;
-        b.x += nx * push; b.y += ny * push;
-        if (a.wreck !== b.wreck) (a.wreck ? a : b).w += (Math.random() - 0.5) * 6 * dt;
       }
     }
 
-    cars = cars.filter(c => {
-      if (outside(c) <= 0.7) return true;
-      if (!c.wreck) passed++;
-      return false;
-    });
+    cars = cars.filter(c => off(c.x, c.y) <= 2.4);
     for (const r of rings) r.t += dt;
     rings = rings.filter(r => r.t < 0.7);
   }
@@ -182,68 +224,81 @@
     poly(g.map(p => [px(...p), py(...p) - z1]), top, INK);
   }
 
-  function drawCar(c) {
-    const a = Math.max(0, 1 - outside(c) / 0.7);
-    if (a <= 0) return;
-    ctx.globalAlpha = a;
-    const h = TW * 0.13;
-    // ground shadow
+  function shadow(x, y, s) {
     ctx.fillStyle = 'rgba(26,26,26,.10)';
     ctx.beginPath();
-    ctx.ellipse(px(c.x, c.y), py(c.x, c.y), TW * 0.2, TH * 0.2, 0, 0, 7);
+    ctx.ellipse(px(x, y), py(x, y), TW * s, TH * s, 0, 0, 7);
     ctx.fill();
-    const col = c.wreck ? ['#3a3936', '#2b2a28', '#1f1e1d'] : ['#fbfaf6', '#e2dfd6', '#cfcbc0'];
+  }
+
+  function drawCar(c) {
+    if (off(c.x, c.y) > 0.6) return;
+    const h = TW * 0.13, col = c.hit ? BLACK : WHITE;
+    shadow(c.x, c.y, 0.2);
     box(c.x, c.y, c.ang, 0.3, 0.16, 0, h, ...col);
     const ox = -0.05 * Math.cos(c.ang), oy = -0.05 * Math.sin(c.ang);
     box(c.x + ox, c.y + oy, c.ang, 0.14, 0.125, h, h * 1.75, ...col);
-    ctx.globalAlpha = 1;
   }
 
-  function drawArrow(tx, ty, idx, alpha) {
-    const [dx, dy] = ORDER[idx];
-    const shape = [[0.33, 0], [0.02, 0.28], [0.02, 0.11], [-0.3, 0.11],
-                   [-0.3, -0.11], [0.02, -0.11], [0.02, -0.28]];
-    const pts = shape.map(([f, s]) => {
-      const gx = tx + f * dx - s * dy, gy = ty + f * dy + s * dx;
-      return [px(gx, gy), py(gx, gy)];
-    });
+  // roadworks arrow board: a little trailer carrying a big lit arrow panel
+  function drawBoard(x, y, idx, alpha, glow) {
+    const [dx, dy] = DIRS[idx];
+    const ang = Math.atan2(dy, dx);
+    const zb = TW * 0.2, zt = TW * 0.6, zm = (zb + zt) / 2;
+    const at = (u, z) => [px(x + u * dx, y + u * dy), py(x + u * dx, y + u * dy) - z];
     ctx.save();
     ctx.globalAlpha = alpha;
-    ctx.shadowColor = ACCENT; ctx.shadowBlur = TW * 0.35;
-    poly(pts, ACCENT, null);
+    shadow(x, y, 0.26);
+    box(x, y, ang, 0.3, 0.1, 0, TW * 0.07, ...WHITE);
+    ctx.strokeStyle = INK;
+    ctx.beginPath();
+    for (const u of [-0.2, 0.2]) { ctx.moveTo(...at(u, TW * 0.07)); ctx.lineTo(...at(u, zb)); }
+    ctx.stroke();
+    poly([at(-0.4, zb), at(0.4, zb), at(0.4, zt), at(-0.4, zt)], BLACK[2], INK);
+    const shape = [[0.3, 0], [0.04, 0.14], [0.04, 0.055], [-0.28, 0.055],
+                   [-0.28, -0.055], [0.04, -0.055], [0.04, -0.14]];
+    ctx.globalAlpha = alpha * glow;
+    ctx.shadowColor = ACCENT; ctx.shadowBlur = TW * 0.3;
+    poly(shape.map(([u, v]) => at(u, zm + v * TW)), ACCENT, null);
     ctx.restore();
   }
 
-  function tilePts(x, y) {
-    return [[x - .5, y - .5], [x + .5, y - .5], [x + .5, y + .5], [x - .5, y + .5]]
-      .map(p => [px(...p), py(...p)]);
+  function tileAtPoint(sx, sy) {
+    const [gx, gy] = toGrid(sx, sy);
+    return [Math.round(gx), Math.round(gy)];
   }
+  const inTray = (sx, sy) => Math.hypot(sx - tray.x, sy - tray.y) < tray.r + 6;
 
   function draw(time) {
     ctx.fillStyle = PAPER;
     ctx.fillRect(0, 0, W, H);
     ctx.lineJoin = 'round';
 
+    // worn tiles: where traffic has recently been
+    let filled = 0;
+    for (const key of visTiles) {
+      const t = heat.get(key);
+      if (t === undefined || simT - t > FILL_MEMORY) continue;
+      filled++;
+      const [x, y] = key.split(',').map(Number);
+      ctx.globalAlpha = 0.07 * Math.min(1, (FILL_MEMORY - (simT - t)) / 2);
+      poly([[x - .5, y - .5], [x + .5, y - .5], [x + .5, y + .5], [x - .5, y + .5]]
+        .map(p => [px(...p), py(...p)]), INK, null);
+    }
+    ctx.globalAlpha = 1;
+
     // grid
+    const [x0, x1, y0, y1] = gridBounds;
     ctx.lineWidth = 1;
     ctx.strokeStyle = 'rgba(26,26,26,.13)';
     ctx.beginPath();
-    for (let i = 0; i <= N; i++) {
-      const t = i - 0.5;
-      ctx.moveTo(px(t, -0.5), py(t, -0.5)); ctx.lineTo(px(t, N - 0.5), py(t, N - 0.5));
-      ctx.moveTo(px(-0.5, t), py(-0.5, t)); ctx.lineTo(px(N - 0.5, t), py(N - 0.5, t));
+    for (let x = x0; x <= x1; x++) {
+      ctx.moveTo(px(x - .5, y0), py(x - .5, y0)); ctx.lineTo(px(x - .5, y1), py(x - .5, y1));
+    }
+    for (let y = y0; y <= y1; y++) {
+      ctx.moveTo(px(x0, y - .5), py(x0, y - .5)); ctx.lineTo(px(x1, y - .5), py(x1, y - .5));
     }
     ctx.stroke();
-    ctx.lineWidth = 1.5;
-    poly([[-.5, -.5], [N - .5, -.5], [N - .5, N - .5], [-.5, N - .5]].map(p => [px(...p), py(...p)]), null, INK);
-
-    // hover + arrows
-    if (hover) poly(tilePts(hover[0], hover[1]), 'rgba(26,26,26,.06)', null);
-    const pulse = 0.82 + 0.18 * Math.sin(time / 260);
-    for (const [key, idx] of arrows) {
-      const [x, y] = key.split(',').map(Number);
-      drawArrow(x, y, idx, pulse);
-    }
 
     // crash rings
     for (const r of rings) {
@@ -255,37 +310,87 @@
       ctx.stroke();
     }
 
-    // cars, back to front
-    ctx.lineWidth = Math.max(1, TW / 38);
-    cars.sort((a, b) => (a.x + a.y) - (b.x + b.y));
-    for (const c of cars) drawCar(c);
+    // cars and boards, back to front
+    const glow = 0.8 + 0.2 * Math.sin(time / 260);
+    ctx.lineWidth = Math.max(1, TW / 42);
+    const items = cars.map(c => ({ d: c.x + c.y, c }));
+    for (const [key, idx] of arrows) {
+      const [x, y] = key.split(',').map(Number);
+      items.push({ d: x + y + 0.05, b: [x, y, idx, 1] });
+    }
+    // ghost of the arrow being carried
+    const carrying = (drag && drag.moved) || (armed && ptr);
+    if (carrying && ptr && !inTray(ptr.x, ptr.y)) {
+      const [x, y] = tileAtPoint(ptr.x, ptr.y);
+      items.push({ d: x + y + 0.05, b: [x, y, drag ? drag.idx : 0, 0.55] });
+    }
+    items.sort((p, q) => p.d - q.d);
+    for (const it of items) it.c ? drawCar(it.c) : drawBoard(...it.b, glow);
 
+    // tray: where arrows are picked up from (and dropped to remove)
+    const hot = armed || (drag && drag.moved && ptr && inTray(ptr.x, ptr.y));
+    ctx.lineWidth = hot ? 2 : 1.5;
+    ctx.beginPath();
+    ctx.arc(tray.x, tray.y, tray.r, 0, 7);
+    ctx.fillStyle = PAPER; ctx.fill();
+    ctx.strokeStyle = hot ? ACCENT : INK; ctx.stroke();
+    ctx.save();
+    ctx.translate(tray.x - px(0, 0), tray.y + TW * 0.26 - py(0, 0));
+    ctx.lineWidth = Math.max(1, TW / 42);
+    drawBoard(0, 0, 0, 1, glow);
+    ctx.restore();
+
+    const pct = visTiles.length ? Math.round(100 * filled / visTiles.length) : 0;
     statsEl.textContent =
-      String(passed).padStart(4, '0') + ' through   ' +
+      String(pct).padStart(3, '0') + '% filled   ' +
       String(incidents).padStart(3, '0') + ' incidents' + (paused ? '   paused' : '');
   }
 
   // ---------- input ----------
-  function tileAt(e) {
-    const [gx, gy] = toGrid(e.clientX, e.clientY);
-    const x = Math.round(gx), y = Math.round(gy);
-    return inside(x, y) ? [x, y] : null;
-  }
-  canvas.addEventListener('pointermove', e => { hover = e.pointerType === 'touch' ? null : tileAt(e); });
-  canvas.addEventListener('pointerleave', () => { hover = null; });
   canvas.addEventListener('pointerdown', e => {
-    const t = tileAt(e);
-    if (!t) return;
-    const key = t[0] + ',' + t[1];
+    ptr = { x: e.clientX, y: e.clientY };
+    const [x, y] = tileAtPoint(e.clientX, e.clientY), key = x + ',' + y;
     if (e.button === 2) { arrows.delete(key); return; }
-    const cur = arrows.get(key);
-    if (cur === undefined) arrows.set(key, 0);
-    else if (cur + 1 < ORDER.length) arrows.set(key, cur + 1);
-    else arrows.delete(key);
+    canvas.setPointerCapture(e.pointerId);
+    if (inTray(e.clientX, e.clientY)) {
+      drag = { type: 'new', idx: 0, sx: e.clientX, sy: e.clientY, moved: false };
+    } else if (arrows.has(key)) {
+      armed = false;
+      drag = { type: 'move', key, idx: arrows.get(key), sx: e.clientX, sy: e.clientY, moved: false };
+    } else if (armed) {
+      arrows.set(key, 0);
+      armed = false;
+    }
   });
+  canvas.addEventListener('pointermove', e => {
+    ptr = { x: e.clientX, y: e.clientY };
+    if (drag && !drag.moved && Math.hypot(e.clientX - drag.sx, e.clientY - drag.sy) > 8) {
+      drag.moved = true;
+      armed = false;
+      if (drag.type === 'move') arrows.delete(drag.key);
+    }
+  });
+  canvas.addEventListener('pointerup', e => {
+    ptr = e.pointerType === 'mouse' ? { x: e.clientX, y: e.clientY } : null;
+    if (!drag) return;
+    if (!drag.moved) {
+      if (drag.type === 'new') armed = !armed;
+      else arrows.set(drag.key, (drag.idx + 1) % DIRS.length);
+    } else if (!inTray(e.clientX, e.clientY)) {
+      const [x, y] = tileAtPoint(e.clientX, e.clientY);
+      arrows.set(x + ',' + y, drag.idx);
+    }
+    drag = null;
+  });
+  canvas.addEventListener('pointercancel', () => {
+    if (drag && drag.type === 'move') arrows.set(drag.key, drag.idx);
+    drag = null; ptr = null;
+  });
+  canvas.addEventListener('pointerleave', () => { if (!drag) ptr = null; });
   canvas.addEventListener('contextmenu', e => e.preventDefault());
   addEventListener('keydown', e => {
     if (e.key === 'c' || e.key === 'C') arrows.clear();
+    if (e.key === 'Escape') armed = false;
     if (e.key === ' ') { paused = !paused; e.preventDefault(); }
   });
   addEventListener('resize', resize);
@@ -294,7 +399,7 @@
   resize();
   let last = performance.now();
   function frame(now) {
-    let dt = Math.min(0.05, (now - last) / 1000);
+    const dt = Math.min(0.05, (now - last) / 1000);
     last = now;
     if (!paused) { step(dt / 2); step(dt / 2); }
     draw(now);
@@ -303,7 +408,11 @@
   requestAnimationFrame(frame);
 
   // test hook
-  window.__tj = { arrows, get cars() { return cars; }, get stats() { return { passed, incidents }; } };
+  window.__tj = {
+    arrows, step, px, py,
+    get cars() { return cars; },
+    get stats() { return { incidents, n: cars.length, black: cars.filter(c => c.hit).length }; },
+  };
 })();
 </script>
 </body>
