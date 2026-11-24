@@ -21,11 +21,20 @@
   #hint span { color: rgba(26,26,26,.55); }
   #hint i { font-style: normal; }
   @media (max-width: 560px) { #hint i { display: none; } }
+  #sound {
+    position: fixed; top: 14px; right: 14px; border: 0; cursor: pointer;
+    font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    letter-spacing: .08em; color: rgba(26,26,26,.55); background: #f1efe9;
+    padding: 6px 8px; border-radius: 3px;
+  }
+  #sound.on { color: #ff5a36; }
+  @media (max-width: 560px) { #stats { text-align: left; left: 10px; } }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
 <div class="hud" id="stats"><span id="statsText"></span></div>
+<button id="sound">sound off</button>
 <div class="hud" id="hint"><span>pick arrow &nbsp;·&nbsp; tap to rotate<i> &nbsp;·&nbsp; drag back to remove</i></span></div>
 <script>
 (() => {
@@ -50,7 +59,8 @@
   let W = 0, H = 0, TW = 0, TH = 0, OX = 0, OY = 0;
   let spawnY = -10, visTiles = [], gridBounds = [0, 0, 0, 0];
   let tray = { x: 0, y: 0, r: 36 };
-  let cars = [], rings = [];
+  let cars = [], rings = [], shocks = [], hotspots = [], bits = [], skids = [];
+  let beat = 0, lastBeat = 0;
   const arrows = new Map();     // "x,y" -> index into DIRS
   const heat = new Map();       // "x,y" -> sim time of last car
   let simT = 0, paused = false, incidents = 0, nextId = 1;
@@ -100,12 +110,121 @@
     while (LANES.some(l => off(l, spawnY) < 1)) spawnY--;
   }
 
+  // ---------- sound (off until asked for) ----------
+  let actx = null, master = null, soundOn = false, lastCrunch = 0;
+  const soundBtn = document.getElementById('sound');
+  soundBtn.addEventListener('click', () => {
+    soundOn = !soundOn;
+    if (soundOn && !actx) {
+      actx = new (window.AudioContext || window.webkitAudioContext)();
+      const comp = actx.createDynamicsCompressor();
+      master = actx.createGain(); master.gain.value = 0.6;
+      master.connect(comp); comp.connect(actx.destination);
+    }
+    if (actx) actx[soundOn ? 'resume' : 'suspend']();
+    soundBtn.textContent = soundOn ? 'sound on' : 'sound off';
+    soundBtn.classList.toggle('on', soundOn);
+  });
+  const audible = () => soundOn && actx && actx.state === 'running' && !document.hidden;
+  // overdriven sub-bass thump
+  function kick(vol) {
+    if (!audible()) return;
+    const t = actx.currentTime, o = actx.createOscillator(), g = actx.createGain(), ws = actx.createWaveShaper();
+    const curve = new Float32Array(256);
+    for (let i = 0; i < 256; i++) curve[i] = Math.tanh((i / 128 - 1) * 4);
+    ws.curve = curve;
+    o.frequency.setValueAtTime(95, t);
+    o.frequency.exponentialRampToValueAtTime(36, t + 0.14);
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.32);
+    o.connect(ws); ws.connect(g); g.connect(master);
+    o.start(t); o.stop(t + 0.34);
+  }
+  // short dusty crunch
+  function crunch(vol) {
+    if (!audible() || actx.currentTime - lastCrunch < 0.05) return;
+    lastCrunch = actx.currentTime;
+    const t = actx.currentTime, len = Math.floor(actx.sampleRate * 0.12);
+    const buf = actx.createBuffer(1, len, actx.sampleRate), d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 2.5);
+    const src = actx.createBufferSource(), f = actx.createBiquadFilter(), g = actx.createGain();
+    src.buffer = buf;
+    f.type = 'bandpass'; f.frequency.value = 400 + Math.random() * 1400; f.Q.value = 0.8;
+    g.gain.value = vol;
+    src.connect(f); f.connect(g); g.connect(master);
+    src.start(t);
+  }
+
+  // ---------- ground distortion ----------
+  // Crashes send ripples through the grid; busy crossings throb on a beat.
+  function warp(gx, gy) {
+    let ox = 0, oy = 0, lift = 0;
+    for (const s of shocks) {
+      const rx = gx - s.x, ry = gy - s.y;
+      if (rx > 7 || rx < -7 || ry > 7 || ry < -7) continue;
+      const d = Math.hypot(rx, ry) || 1e-6;
+      const q = (d - s.t * 7) / 0.7;
+      const g = Math.exp(-q * q) * s.a * (1 - s.t / 0.8);
+      ox += rx / d * g * 0.22; oy += ry / d * g * 0.22; lift += g * 0.16;
+    }
+    for (const h of hotspots) {
+      const rx = gx - h.x, ry = gy - h.y;
+      if (rx > 6 || rx < -6 || ry > 6 || ry < -6) continue;
+      const d2 = rx * rx + ry * ry, d = Math.sqrt(d2) || 1e-6;
+      const f = Math.exp(-d2 / 5) * h.e;
+      const m = f * beat * Math.min(d, 1);
+      ox += rx / d * m * 0.2; oy += ry / d * m * 0.2;
+      lift += f * (beat * 0.14 + 0.025 * Math.sin(simT * 31 + gx * 3.1 + gy * 4.7));
+    }
+    return [(ox - oy) * TW / 2, (ox + oy) * TH / 2 - lift * TW];
+  }
+  const warping = () => shocks.length || hotspots.length;
+  function P(gx, gy) {
+    if (!warping()) return [px(gx, gy), py(gx, gy)];
+    const w = warp(gx, gy);
+    return [px(gx, gy) + w[0], py(gx, gy) + w[1]];
+  }
+
+  function impact(a, b, nx, ny) {
+    const first = !a.hit || !b.hit, k = first ? 1 : 0.65;
+    const x = (a.x + b.x) / 2, y = (a.y + b.y) / 2;
+    [a, b].forEach((c, i) => {
+      const sg = i ? 1 : -1;
+      c.kx += sg * nx * 1.5 * k + (Math.random() - 0.5) * 0.9;
+      c.ky += sg * ny * 1.5 * k + (Math.random() - 0.5) * 0.9;
+      c.spin += (Math.random() - 0.5) * 22 * k;
+      c.vz = (0.9 + Math.random() * 1.1) * k;
+      c.v *= 0.35;
+      c.cool = 0.28 + Math.random() * 0.2;
+      c.daze = 0.55;
+      c.hit = true;
+    });
+    incidents++;
+    rings.push({ x, y, t: 0 });
+    shocks.push({ x, y, t: 0, a: k });
+    if (shocks.length > 12) shocks.shift();
+    let h = hotspots.find(h => Math.hypot(h.x - x, h.y - y) < 2.5);
+    if (!h) hotspots.push(h = { x, y, e: 0 });
+    h.x += (x - h.x) * 0.15; h.y += (y - h.y) * 0.15;
+    h.e = Math.min(1, h.e + 0.14);
+    for (let i = 0; i < 5 && bits.length < 260; i++) {
+      const an = Math.random() * 6.28, sp = 0.6 + Math.random() * 2.2;
+      bits.push({ x, y, z: 0.1, vx: Math.cos(an) * sp, vy: Math.sin(an) * sp,
+                  vz: 1.5 + Math.random() * 2.5, t: 0, hot: Math.random() < 0.3 });
+    }
+    skids.push({ x: x + (Math.random() - 0.5) * 0.4, y: y + (Math.random() - 0.5) * 0.4,
+                 r: 0.18 + Math.random() * 0.22, t: 0 });
+    if (skids.length > 160) skids.shift();
+    crunch(first ? 0.5 : 0.28);
+  }
+
   // ---------- simulation ----------
   function spawn(lane) {
     for (const c of cars) if (Math.hypot(c.x - lane, c.y - spawnY) < 0.95) return false;
     cars.push({
       id: nextId++, x: lane, y: spawnY, dx: 0, dy: 1, ang: Math.PI / 2, v: SPEED,
       hit: false, m: 0.6 + Math.random() * 0.8,
+      kx: 0, ky: 0, spin: 0, z: 0, vz: 0, cool: 0, daze: 0,
     });
     return true;
   }
@@ -144,9 +263,16 @@
           target = Math.min(target, SPEED * Math.max(0, (along - GAP) / 0.5));
       }
       c.v += (target - c.v) * Math.min(1, 10 * dt);
-      c.x += c.dx * c.v * dt; c.y += c.dy * c.v * dt;
-      // pull back to lane centre
-      const k = Math.min(1, 5 * dt);
+      c.x += (c.dx * c.v + c.kx) * dt; c.y += (c.dy * c.v + c.ky) * dt;
+      const kf = Math.exp(-4 * dt);
+      c.kx *= kf; c.ky *= kf;
+      c.cool -= dt; c.daze -= dt;
+      if (c.z > 0 || c.vz > 0) {
+        c.z += c.vz * dt; c.vz -= 9 * dt;
+        if (c.z < 0) { c.z = 0; c.vz = 0; }
+      }
+      // pull back to lane centre (loosely while dazed)
+      const k = Math.min(1, (c.daze > 0 ? 1.2 : 5) * dt);
       if (c.dx !== 0) c.y += (Math.round(c.y) - c.y) * k;
       else c.x += (Math.round(c.x) - c.x) * k;
       // obey arrow boards once the tile centre is reached
@@ -159,7 +285,8 @@
       // steer body toward heading (battered cars straighten out slowly)
       let d = Math.atan2(c.dy, c.dx) - c.ang;
       d = Math.atan2(Math.sin(d), Math.cos(d));
-      c.ang += d * Math.min(1, (c.hit ? 5 : 12) * dt);
+      c.ang += d * Math.min(1, (c.daze > 0 ? 2 : c.hit ? 6 : 12) * dt) + c.spin * dt;
+      c.spin *= Math.exp(-3.5 * dt);
     }
 
     // collisions: crossing traffic crashes, turns black, and shoves its way through
@@ -180,23 +307,32 @@
         const slip = 0.7 * dt;
         a.x += ny * slip; a.y -= nx * slip;
         b.x -= ny * slip; b.y += nx * slip;
-        a.ang += (Math.random() - 0.5) * 8 * dt;
-        b.ang += (Math.random() - 0.5) * 8 * dt;
-        if (!a.hit || !b.hit) {
-          for (const c of [a, b]) {
-            if (c.hit) continue;
-            c.hit = true; c.v *= 0.3;
-            c.ang += (Math.random() - 0.5) * 2.2;
-          }
-          incidents++;
-          rings.push({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, t: 0 });
-        }
+        if (a.cool <= 0 || b.cool <= 0) impact(a, b, nx, ny);
       }
     }
 
     cars = cars.filter(c => off(c.x, c.y) <= 2.4);
     for (const r of rings) r.t += dt;
     rings = rings.filter(r => r.t < 0.7);
+    for (const s of shocks) s.t += dt;
+    shocks = shocks.filter(s => s.t < 0.8);
+    for (const h of hotspots) h.e *= Math.exp(-0.45 * dt);
+    hotspots = hotspots.filter(h => h.e > 0.03);
+    for (const p of bits) {
+      p.t += dt; p.x += p.vx * dt; p.y += p.vy * dt; p.z += p.vz * dt; p.vz -= 9 * dt;
+      if (p.z < 0) { p.z = 0; p.vz *= -0.35; p.vx *= 0.5; p.vy *= 0.5; }
+    }
+    bits = bits.filter(p => p.t < 1.1);
+    for (const k of skids) k.t += dt;
+    skids = skids.filter(k => k.t < 25);
+    // the beat: crossings throb together, louder the busier they are
+    const ph = (simT * 2.1) % 1;
+    beat = Math.exp(-ph * 5);
+    if (ph < lastBeat) {
+      const e = hotspots.reduce((m, h) => Math.max(m, h.e), 0);
+      if (e > 0.15) kick(0.25 + 0.6 * e);
+    }
+    lastBeat = ph;
   }
 
   // ---------- rendering ----------
@@ -233,11 +369,14 @@
 
   function drawCar(c) {
     if (off(c.x, c.y) > 0.6) return;
-    const h = TW * 0.13, col = c.hit ? BLACK : WHITE;
+    const h = TW * 0.13, col = c.hit ? BLACK : WHITE, z = c.z * TW * 0.5;
+    const w = warping() ? warp(c.x, c.y) : null;
+    if (w) { ctx.save(); ctx.translate(w[0], w[1]); }
     shadow(c.x, c.y, 0.2);
-    box(c.x, c.y, c.ang, 0.3, 0.16, 0, h, ...col);
+    box(c.x, c.y, c.ang, 0.3, 0.16, z, z + h, ...col);
     const ox = -0.05 * Math.cos(c.ang), oy = -0.05 * Math.sin(c.ang);
-    box(c.x + ox, c.y + oy, c.ang, 0.14, 0.125, h, h * 1.75, ...col);
+    box(c.x + ox, c.y + oy, c.ang, 0.14, 0.125, z + h, z + h * 1.75, ...col);
+    if (w) ctx.restore();
   }
 
   // roadworks arrow board: a little trailer carrying a big lit arrow panel
@@ -247,6 +386,7 @@
     const zb = TW * 0.2, zt = TW * 0.6, zm = (zb + zt) / 2;
     const at = (u, z) => [px(x + u * dx, y + u * dy), py(x + u * dx, y + u * dy) - z];
     ctx.save();
+    if (warping()) ctx.translate(...warp(x, y));
     ctx.globalAlpha = alpha;
     shadow(x, y, 0.26);
     box(x, y, ang, 0.3, 0.1, 0, TW * 0.07, ...WHITE);
@@ -283,7 +423,14 @@
       const [x, y] = key.split(',').map(Number);
       ctx.globalAlpha = 0.07 * Math.min(1, (FILL_MEMORY - (simT - t)) / 2);
       poly([[x - .5, y - .5], [x + .5, y - .5], [x + .5, y + .5], [x - .5, y + .5]]
-        .map(p => [px(...p), py(...p)]), INK, null);
+        .map(p => P(...p)), INK, null);
+    }
+    // scorch marks left by crashes
+    ctx.fillStyle = INK;
+    for (const k of skids) {
+      ctx.globalAlpha = 0.09 * Math.min(1, (25 - k.t) / 8);
+      const [sx, sy] = P(k.x, k.y);
+      ctx.beginPath(); ctx.ellipse(sx, sy, TW * k.r, TH * k.r, 0, 0, 7); ctx.fill();
     }
     ctx.globalAlpha = 1;
 
@@ -292,11 +439,28 @@
     ctx.lineWidth = 1;
     ctx.strokeStyle = 'rgba(26,26,26,.13)';
     ctx.beginPath();
-    for (let x = x0; x <= x1; x++) {
-      ctx.moveTo(px(x - .5, y0), py(x - .5, y0)); ctx.lineTo(px(x - .5, y1), py(x - .5, y1));
-    }
-    for (let y = y0; y <= y1; y++) {
-      ctx.moveTo(px(x0, y - .5), py(x0, y - .5)); ctx.lineTo(px(x1, y - .5), py(x1, y - .5));
+    if (!warping()) {
+      for (let x = x0; x <= x1; x++) {
+        ctx.moveTo(px(x - .5, y0), py(x - .5, y0)); ctx.lineTo(px(x - .5, y1), py(x - .5, y1));
+      }
+      for (let y = y0; y <= y1; y++) {
+        ctx.moveTo(px(x0, y - .5), py(x0, y - .5)); ctx.lineTo(px(x1, y - .5), py(x1, y - .5));
+      }
+    } else {
+      // bend every grid line through the distortion field
+      const cols = x1 - x0 + 2, pts = [];
+      for (let y = y0; y <= y1 + 1; y++)
+        for (let x = x0; x <= x1 + 1; x++) pts.push(P(x - .5, y - .5));
+      for (let y = 0; y <= y1 - y0 + 1; y++)
+        for (let x = 0; x < cols; x++) {
+          const p = pts[y * cols + x];
+          x ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]);
+        }
+      for (let x = 0; x < cols; x++)
+        for (let y = 0; y <= y1 - y0 + 1; y++) {
+          const p = pts[y * cols + x];
+          y ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]);
+        }
     }
     ctx.stroke();
 
@@ -306,7 +470,8 @@
       ctx.strokeStyle = `rgba(255,90,54,${1 - k})`;
       ctx.lineWidth = 2;
       ctx.beginPath();
-      ctx.ellipse(px(r.x, r.y), py(r.x, r.y), TW * (0.2 + k * 0.7), TH * (0.2 + k * 0.7), 0, 0, 7);
+      const [sx, sy] = P(r.x, r.y);
+      ctx.ellipse(sx, sy, TW * (0.2 + k * 0.9), TH * (0.2 + k * 0.9), 0, 0, 7);
       ctx.stroke();
     }
 
@@ -326,6 +491,15 @@
     }
     items.sort((p, q) => p.d - q.d);
     for (const it of items) it.c ? drawCar(it.c) : drawBoard(...it.b, glow);
+
+    // flying debris
+    for (const p of bits) {
+      const [sx, sy] = P(p.x, p.y), sz = Math.max(2, TW * 0.035);
+      ctx.globalAlpha = Math.min(1, (1.1 - p.t) * 3);
+      ctx.fillStyle = p.hot ? ACCENT : INK;
+      ctx.fillRect(sx - sz / 2, sy - p.z * TW * 0.5 - sz / 2, sz, sz);
+    }
+    ctx.globalAlpha = 1;
 
     // tray: where arrows are picked up from (and dropped to remove)
     const hot = armed || (drag && drag.moved && ptr && inTray(ptr.x, ptr.y));
