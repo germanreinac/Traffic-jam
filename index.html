@@ -44,6 +44,7 @@
   const R = 0.23;               // collision radius (tiles)
   const GAP = 0.8;              // following distance
   const MAX_CARS = 420;
+  const BLACK_TIME = 2;         // seconds a car stays black after its last crash
   const FILL_MEMORY = 9;        // seconds a tile stays "filled" after a car passes
   const INK = '#1a1a1a', PAPER = '#f1efe9', ACCENT = '#ff5a36';
   const WHITE = ['#fbfaf6', '#e2dfd6', '#cfcbc0'];   // top, left, right faces
@@ -198,6 +199,7 @@
       c.cool = 0.28 + Math.random() * 0.2;
       c.daze = 0.55;
       c.hit = true;
+      c.black = BLACK_TIME;
     });
     incidents++;
     rings.push({ x, y, t: 0 });
@@ -224,7 +226,7 @@
     cars.push({
       id: nextId++, x: lane, y: spawnY, dx: 0, dy: 1, ang: Math.PI / 2, v: SPEED,
       hit: false, m: 0.6 + Math.random() * 0.8,
-      kx: 0, ky: 0, spin: 0, z: 0, vz: 0, cool: 0, daze: 0,
+      kx: 0, ky: 0, spin: 0, black: 0, z: 0, vz: 0, cool: 0, daze: 0,
     });
     return true;
   }
@@ -267,6 +269,7 @@
       const kf = Math.exp(-4 * dt);
       c.kx *= kf; c.ky *= kf;
       c.cool -= dt; c.daze -= dt;
+      if (c.hit && (c.black -= dt) <= 0) c.hit = false;
       if (c.z > 0 || c.vz > 0) {
         c.z += c.vz * dt; c.vz -= 9 * dt;
         if (c.z < 0) { c.z = 0; c.vz = 0; }
@@ -360,6 +363,11 @@
     poly(g.map(p => [px(...p), py(...p) - z1]), top, INK);
   }
 
+  function mix(a, b, t) {
+    const ch = (h, i) => parseInt(h.slice(1 + i * 2, 3 + i * 2), 16);
+    return 'rgb(' + [0, 1, 2].map(i => Math.round(ch(a, i) + (ch(b, i) - ch(a, i)) * t)).join(',') + ')';
+  }
+
   function shadow(x, y, s) {
     ctx.fillStyle = 'rgba(26,26,26,.10)';
     ctx.beginPath();
@@ -369,7 +377,8 @@
 
   function drawCar(c) {
     if (off(c.x, c.y) > 0.6) return;
-    const h = TW * 0.13, col = c.hit ? BLACK : WHITE, z = c.z * TW * 0.5;
+    const h = TW * 0.13, z = c.z * TW * 0.5;
+    const col = !c.hit ? WHITE : c.black > 0.4 ? BLACK : BLACK.map((b, i) => mix(WHITE[i], b, c.black / 0.4));
     const w = warping() ? warp(c.x, c.y) : null;
     if (w) { ctx.save(); ctx.translate(w[0], w[1]); }
     shadow(c.x, c.y, 0.2);
